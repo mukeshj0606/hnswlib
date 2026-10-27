@@ -6,6 +6,11 @@
 #include <assert.h>
 #include <stdlib.h>
 
+#ifdef _MSC_VER
+#include <malloc.h>
+#endif
+
+#include <algorithm>
 #include <atomic>
 #include <iostream>
 #include <limits>
@@ -19,6 +24,50 @@ namespace hnswlib {
 typedef unsigned int tableint;
 constexpr tableint kInvalidInternalId = std::numeric_limits<tableint>::max();
 typedef unsigned int linklistsizeint;
+
+static constexpr size_t kDataAlignment = 32;
+
+static inline size_t alignUp(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static inline void* alignedMalloc(size_t size, size_t alignment) {
+#ifdef _MSC_VER
+    return _aligned_malloc(size, alignment);
+#else
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0)
+        return nullptr;
+    return ptr;
+#endif
+}
+
+static inline void alignedFree(void* ptr) {
+#ifdef _MSC_VER
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+static inline void* alignedRealloc(void* ptr,
+    size_t old_size,
+    size_t new_size,
+    size_t alignment) {
+#ifdef _MSC_VER
+    (void)old_size;
+    return _aligned_realloc(ptr, new_size, alignment);
+#else
+    void* new_ptr = alignedMalloc(new_size, alignment);
+    if (new_ptr == nullptr)
+        return nullptr;
+    if (ptr != nullptr) {
+        memcpy(new_ptr, ptr, std::min(old_size, new_size));
+        alignedFree(ptr);
+    }
+    return new_ptr;
+#endif
+}
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -76,6 +125,35 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
+    // When the graph is built AND queried entirely by a single thread (the case
+    // for the SfM Section-1 scored pipeline: initialize_hnsw_space inserts in a
+    // plain serial for-loop and TBB runs with max_concurrency()==1), every
+    // std::mutex acquisition in addPoint/searchBaseLayer/mutuallyConnectNewElement
+    // is UNCONTENDED overhead (a lock cmpxchg + futex fast path per lock). With
+    // ~7541 serial insertions/image and a link_list_locks_ acquire on EVERY node
+    // pop in the greedy descent, this showed up as ~2.1% self-time in
+    // pthread_mutex_lock/unlock. When single_thread_ is set we skip the locks
+    // entirely. This changes ONLY serialization (no-op when already serial), so
+    // the graph structure and all FP are bit-identical -> point counts unchanged.
+    // Default false keeps the library thread-safe for any concurrent caller;
+    // the SfM builder opts in via setSingleThread(true) right after construction.
+    bool single_thread_{false};
+
+    // RAII wrapper that acquires `m` only when `enabled` is true. Same scope
+    // semantics as std::unique_lock so it is a drop-in at the lock sites.
+    struct MaybeLock {
+        std::mutex* m_{nullptr};
+        MaybeLock(std::mutex& m, bool enabled) : m_(enabled ? &m : nullptr) {
+            if (m_) m_->lock();
+        }
+        ~MaybeLock() { if (m_) m_->unlock(); }
+        // Explicit early release (idempotent), matching std::unique_lock::unlock
+        // usage at the label-lookup site. A no-op when the lock was elided.
+        void unlock() { if (m_) { m_->unlock(); m_ = nullptr; } }
+        MaybeLock(const MaybeLock&) = delete;
+        MaybeLock& operator=(const MaybeLock&) = delete;
+    };
+
 
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
     }
@@ -124,12 +202,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         update_probability_generator_.seed(random_seed + 1);
 
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-        size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
-        offsetData_ = size_links_level0_;
-        label_offset_ = size_links_level0_ + data_size_;
+        offsetData_ = alignUp(size_links_level0_, kDataAlignment);
+        label_offset_ = offsetData_ + data_size_;
+        size_data_per_element_ =
+            alignUp(label_offset_ + sizeof(labeltype), kDataAlignment);
         offsetLevel0_ = 0;
 
-        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
+        data_level0_memory_ =
+            (char *) alignedMalloc(max_elements_ * size_data_per_element_, kDataAlignment);
         if (data_level0_memory_ == nullptr) {
             HNSWLIB_THROW_RUNTIME_ERROR("Not enough memory to allocate for level 0");
         }
@@ -159,7 +239,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     void clear() {
-        free(data_level0_memory_);
+        alignedFree(data_level0_memory_);
         data_level0_memory_ = nullptr;
         for (tableint i = 0; i < cur_element_count; i++) {
             if (element_levels_[i] > 0)
@@ -184,6 +264,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     void setEf(size_t ef) {
         ef_ = ef;
+    }
+
+    // Opt in to the single-thread lock-elision fast path (see single_thread_).
+    // Only call this when NO other thread will ever touch this instance.
+    void setSingleThread(bool v) {
+        single_thread_ = v;
     }
 
 
@@ -248,8 +334,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidateSet;
+        std::vector<std::pair<dist_t, tableint>> top_candidate_storage;
+        top_candidate_storage.reserve(ef_construction_ + 1);
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+            top_candidates(CompareByFirst(), std::move(top_candidate_storage));
+
+        std::vector<std::pair<dist_t, tableint>> candidate_set_storage;
+        candidate_set_storage.reserve(ef_construction_ + maxM0_);
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+            candidateSet(CompareByFirst(), std::move(candidate_set_storage));
 
         dist_t lowerBound;
         if (!isMarkedDeleted(ep_id)) {
@@ -272,7 +365,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             tableint curNodeNum = curr_el_pair.second;
 
-            std::unique_lock <std::mutex> lock(link_list_locks_[curNodeNum]);
+            MaybeLock lock(link_list_locks_[curNodeNum], !single_thread_);
 
             int *data;  // = (int *)(linkList0_ + curNodeNum * size_links_per_element0_);
             if (layer == 0) {
@@ -479,8 +572,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return;
         }
 
-        std::priority_queue<std::pair<dist_t, tableint>> queue_closest;
+        std::vector<std::pair<dist_t, tableint>> queue_storage;
+        queue_storage.reserve(top_candidates.size());
+        std::priority_queue<std::pair<dist_t, tableint>> queue_closest(
+            std::less<std::pair<dist_t, tableint>>(), std::move(queue_storage));
         std::vector<std::pair<dist_t, tableint>> return_list;
+        return_list.reserve(M);
         while (top_candidates.size() > 0) {
             queue_closest.emplace(-top_candidates.top().first, top_candidates.top().second);
             top_candidates.pop();
@@ -494,7 +591,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             queue_closest.pop();
             bool good = true;
 
-            for (std::pair<dist_t, tableint> second_pair : return_list) {
+            for (const std::pair<dist_t, tableint>& second_pair : return_list) {
                 dist_t curdist =
                         fstdistfunc_(getDataByInternalId(second_pair.second),
                                         getDataByInternalId(curent_pair.second),
@@ -509,7 +606,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
-        for (std::pair<dist_t, tableint> curent_pair : return_list) {
+        for (const std::pair<dist_t, tableint>& curent_pair : return_list) {
             top_candidates.emplace(-curent_pair.first, curent_pair.second);
         }
     }
@@ -584,7 +681,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
-            std::unique_lock <std::mutex> lock(link_list_locks_[selectedNeighbors[idx]]);
+            MaybeLock lock(link_list_locks_[selectedNeighbors[idx]], !single_thread_);
 
             linklistsizeint *ll_other;
             if (level == 0)
@@ -679,7 +776,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::vector<std::mutex>(new_max_elements).swap(link_list_locks_);
 
         // Reallocate base layer
-        char * data_level0_memory_new = (char *) realloc(data_level0_memory_, new_max_elements * size_data_per_element_);
+        char * data_level0_memory_new = (char *) alignedRealloc(data_level0_memory_,
+            max_elements_ * size_data_per_element_,
+            new_max_elements * size_data_per_element_,
+            kDataAlignment);
         if (data_level0_memory_new == nullptr)
             return Status("Not enough memory: resizeIndex failed to allocate base layer");
         data_level0_memory_ = data_level0_memory_new;
@@ -859,7 +959,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         input.seekg(pos, input.beg);
 
-        data_level0_memory_ = (char *) malloc(max_elements * size_data_per_element_);
+        data_level0_memory_ =
+            (char *) alignedMalloc(max_elements * size_data_per_element_, kDataAlignment);
         if (data_level0_memory_ == nullptr)
             return Status("Not enough memory: loadIndex failed to allocate level0");
         input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
@@ -1281,7 +1382,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         {
             // Checking if the element with the same label already exists
             // if so, updating it *instead* of creating a new element.
-            std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+            MaybeLock lock_table(label_lookup_lock, !single_thread_);
             auto search = label_lookup_.find(label);
             if (search != label_lookup_.end()) {
                 tableint existingInternalId = search->second;
@@ -1320,14 +1421,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             label_lookup_[label] = cur_c;
         }
 
-        std::unique_lock <std::mutex> lock_el(link_list_locks_[cur_c]);
+        MaybeLock lock_el(link_list_locks_[cur_c], !single_thread_);
         int curlevel = getRandomLevel(mult_);
         if (level > 0)
             curlevel = level;
 
         element_levels_[cur_c] = curlevel;
 
-        std::unique_lock <std::mutex> templock(global);
+        MaybeLock templock(global, !single_thread_);
         int maxlevelcopy = maxlevel_;
         if (curlevel <= maxlevelcopy)
             templock.unlock();
@@ -1356,7 +1457,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     while (changed) {
                         changed = false;
                         unsigned int *data;
-                        std::unique_lock <std::mutex> lock(link_list_locks_[currObj]);
+                        MaybeLock lock(link_list_locks_[currObj], !single_thread_);
                         data = get_linklist(currObj, level);
                         int size = getListCount(data);
 
