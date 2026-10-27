@@ -6,6 +6,11 @@
 #include <assert.h>
 #include <stdlib.h>
 
+#ifdef _MSC_VER
+#include <malloc.h>
+#endif
+
+#include <algorithm>
 #include <atomic>
 #include <iostream>
 #include <limits>
@@ -19,6 +24,50 @@ namespace hnswlib {
 typedef unsigned int tableint;
 constexpr tableint kInvalidInternalId = std::numeric_limits<tableint>::max();
 typedef unsigned int linklistsizeint;
+
+static constexpr size_t kDataAlignment = 32;
+
+static inline size_t alignUp(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static inline void* alignedMalloc(size_t size, size_t alignment) {
+#ifdef _MSC_VER
+    return _aligned_malloc(size, alignment);
+#else
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0)
+        return nullptr;
+    return ptr;
+#endif
+}
+
+static inline void alignedFree(void* ptr) {
+#ifdef _MSC_VER
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
+
+static inline void* alignedRealloc(void* ptr,
+    size_t old_size,
+    size_t new_size,
+    size_t alignment) {
+#ifdef _MSC_VER
+    (void)old_size;
+    return _aligned_realloc(ptr, new_size, alignment);
+#else
+    void* new_ptr = alignedMalloc(new_size, alignment);
+    if (new_ptr == nullptr)
+        return nullptr;
+    if (ptr != nullptr) {
+        memcpy(new_ptr, ptr, std::min(old_size, new_size));
+        alignedFree(ptr);
+    }
+    return new_ptr;
+#endif
+}
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -124,12 +173,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         update_probability_generator_.seed(random_seed + 1);
 
         size_links_level0_ = maxM0_ * sizeof(tableint) + sizeof(linklistsizeint);
-        size_data_per_element_ = size_links_level0_ + data_size_ + sizeof(labeltype);
-        offsetData_ = size_links_level0_;
-        label_offset_ = size_links_level0_ + data_size_;
+        offsetData_ = alignUp(size_links_level0_, kDataAlignment);
+        label_offset_ = offsetData_ + data_size_;
+        size_data_per_element_ =
+            alignUp(label_offset_ + sizeof(labeltype), kDataAlignment);
         offsetLevel0_ = 0;
 
-        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
+        data_level0_memory_ =
+            (char *) alignedMalloc(max_elements_ * size_data_per_element_, kDataAlignment);
         if (data_level0_memory_ == nullptr) {
             HNSWLIB_THROW_RUNTIME_ERROR("Not enough memory to allocate for level 0");
         }
@@ -159,7 +210,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     void clear() {
-        free(data_level0_memory_);
+        alignedFree(data_level0_memory_);
         data_level0_memory_ = nullptr;
         for (tableint i = 0; i < cur_element_count; i++) {
             if (element_levels_[i] > 0)
@@ -679,7 +730,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::vector<std::mutex>(new_max_elements).swap(link_list_locks_);
 
         // Reallocate base layer
-        char * data_level0_memory_new = (char *) realloc(data_level0_memory_, new_max_elements * size_data_per_element_);
+        char * data_level0_memory_new = (char *) alignedRealloc(data_level0_memory_,
+            max_elements_ * size_data_per_element_,
+            new_max_elements * size_data_per_element_,
+            kDataAlignment);
         if (data_level0_memory_new == nullptr)
             return Status("Not enough memory: resizeIndex failed to allocate base layer");
         data_level0_memory_ = data_level0_memory_new;
@@ -859,7 +913,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         input.seekg(pos, input.beg);
 
-        data_level0_memory_ = (char *) malloc(max_elements * size_data_per_element_);
+        data_level0_memory_ =
+            (char *) alignedMalloc(max_elements * size_data_per_element_, kDataAlignment);
         if (data_level0_memory_ == nullptr)
             return Status("Not enough memory: loadIndex failed to allocate level0");
         input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
