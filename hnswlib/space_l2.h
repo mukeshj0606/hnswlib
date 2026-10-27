@@ -5,8 +5,8 @@ namespace hnswlib {
 
 static float
 L2Sqr(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
-    float *pVect1 = (float *) pVect1v;
-    float *pVect2 = (float *) pVect2v;
+    const float *__restrict pVect1 = (const float *) pVect1v;
+    const float *__restrict pVect2 = (const float *) pVect2v;
     size_t qty = *((size_t *) qty_ptr);
 
     float res = 0;

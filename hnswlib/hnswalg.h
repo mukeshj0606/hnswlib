@@ -334,8 +334,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
-        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidateSet;
+        std::vector<std::pair<dist_t, tableint>> top_candidate_storage;
+        top_candidate_storage.reserve(ef_construction_ + 1);
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+            top_candidates(CompareByFirst(), std::move(top_candidate_storage));
+
+        std::vector<std::pair<dist_t, tableint>> candidate_set_storage;
+        candidate_set_storage.reserve(ef_construction_ + maxM0_);
+        std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
+            candidateSet(CompareByFirst(), std::move(candidate_set_storage));
 
         dist_t lowerBound;
         if (!isMarkedDeleted(ep_id)) {
@@ -565,8 +572,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             return;
         }
 
-        std::priority_queue<std::pair<dist_t, tableint>> queue_closest;
+        std::vector<std::pair<dist_t, tableint>> queue_storage;
+        queue_storage.reserve(top_candidates.size());
+        std::priority_queue<std::pair<dist_t, tableint>> queue_closest(
+            std::less<std::pair<dist_t, tableint>>(), std::move(queue_storage));
         std::vector<std::pair<dist_t, tableint>> return_list;
+        return_list.reserve(M);
         while (top_candidates.size() > 0) {
             queue_closest.emplace(-top_candidates.top().first, top_candidates.top().second);
             top_candidates.pop();
@@ -580,7 +591,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             queue_closest.pop();
             bool good = true;
 
-            for (std::pair<dist_t, tableint> second_pair : return_list) {
+            for (const std::pair<dist_t, tableint>& second_pair : return_list) {
                 dist_t curdist =
                         fstdistfunc_(getDataByInternalId(second_pair.second),
                                         getDataByInternalId(curent_pair.second),
@@ -595,7 +606,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
-        for (std::pair<dist_t, tableint> curent_pair : return_list) {
+        for (const std::pair<dist_t, tableint>& curent_pair : return_list) {
             top_candidates.emplace(-curent_pair.first, curent_pair.second);
         }
     }
