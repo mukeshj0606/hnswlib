@@ -76,6 +76,25 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
+    // If only one thread ever uses this index, setSingleThread(true) skips the build-time locks it doesn't need.
+    // The graph and search results are identical; the default (false) keeps the index safe for multi-threaded use.
+    bool single_thread_{false};
+
+    // RAII wrapper that acquires `m` only when `enabled` is true. Same scope
+    // semantics as std::unique_lock so it is a drop-in at the lock sites.
+    struct MaybeLock {
+        std::mutex* m_{nullptr};
+        MaybeLock(std::mutex& m, bool enabled) : m_(enabled ? &m : nullptr) {
+            if (m_) m_->lock();
+        }
+        ~MaybeLock() { if (m_) m_->unlock(); }
+        // Explicit early release (idempotent), matching std::unique_lock::unlock
+        // usage at the label-lookup site. A no-op when the lock was elided.
+        void unlock() { if (m_) { m_->unlock(); m_ = nullptr; } }
+        MaybeLock(const MaybeLock&) = delete;
+        MaybeLock& operator=(const MaybeLock&) = delete;
+    };
+
 
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
     }
@@ -186,6 +205,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         ef_ = ef;
     }
 
+    // Opt in to the single-thread lock-elision fast path (see single_thread_).
+    // Only call this when NO other thread will ever touch this instance.
+    void setSingleThread(bool v) {
+        single_thread_ = v;
+    }
+
 
     inline std::mutex& getLabelOpMutex(labeltype label) const {
         // calculate hash
@@ -272,7 +297,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             tableint curNodeNum = curr_el_pair.second;
 
-            std::unique_lock <std::mutex> lock(link_list_locks_[curNodeNum]);
+            MaybeLock lock(link_list_locks_[curNodeNum], !single_thread_);
 
             int *data;  // = (int *)(linkList0_ + curNodeNum * size_links_per_element0_);
             if (layer == 0) {
@@ -584,7 +609,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
-            std::unique_lock <std::mutex> lock(link_list_locks_[selectedNeighbors[idx]]);
+            MaybeLock lock(link_list_locks_[selectedNeighbors[idx]], !single_thread_);
 
             linklistsizeint *ll_other;
             if (level == 0)
@@ -1281,7 +1306,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         {
             // Checking if the element with the same label already exists
             // if so, updating it *instead* of creating a new element.
-            std::unique_lock <std::mutex> lock_table(label_lookup_lock);
+            MaybeLock lock_table(label_lookup_lock, !single_thread_);
             auto search = label_lookup_.find(label);
             if (search != label_lookup_.end()) {
                 tableint existingInternalId = search->second;
@@ -1320,14 +1345,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             label_lookup_[label] = cur_c;
         }
 
-        std::unique_lock <std::mutex> lock_el(link_list_locks_[cur_c]);
+        MaybeLock lock_el(link_list_locks_[cur_c], !single_thread_);
         int curlevel = getRandomLevel(mult_);
         if (level > 0)
             curlevel = level;
 
         element_levels_[cur_c] = curlevel;
 
-        std::unique_lock <std::mutex> templock(global);
+        MaybeLock templock(global, !single_thread_);
         int maxlevelcopy = maxlevel_;
         if (curlevel <= maxlevelcopy)
             templock.unlock();
@@ -1356,7 +1381,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     while (changed) {
                         changed = false;
                         unsigned int *data;
-                        std::unique_lock <std::mutex> lock(link_list_locks_[currObj]);
+                        MaybeLock lock(link_list_locks_[currObj], !single_thread_);
                         data = get_linklist(currObj, level);
                         int size = getListCount(data);
 
