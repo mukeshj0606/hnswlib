@@ -76,18 +76,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
-    // When the graph is built AND queried entirely by a single thread (the case
-    // for the SfM Section-1 scored pipeline: initialize_hnsw_space inserts in a
-    // plain serial for-loop and TBB runs with max_concurrency()==1), every
-    // std::mutex acquisition in addPoint/searchBaseLayer/mutuallyConnectNewElement
-    // is UNCONTENDED overhead (a lock cmpxchg + futex fast path per lock). With
-    // ~7541 serial insertions/image and a link_list_locks_ acquire on EVERY node
-    // pop in the greedy descent, this showed up as ~2.1% self-time in
-    // pthread_mutex_lock/unlock. When single_thread_ is set we skip the locks
-    // entirely. This changes ONLY serialization (no-op when already serial), so
-    // the graph structure and all FP are bit-identical -> point counts unchanged.
-    // Default false keeps the library thread-safe for any concurrent caller;
-    // the SfM builder opts in via setSingleThread(true) right after construction.
+    // If only one thread ever uses this index, setSingleThread(true) skips the build-time locks it doesn't need.
+    // The graph and search results are identical; the default (false) keeps the index safe for multi-threaded use.
     bool single_thread_{false};
 
     // RAII wrapper that acquires `m` only when `enabled` is true. Same scope
